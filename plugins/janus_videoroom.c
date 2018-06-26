@@ -1207,6 +1207,9 @@ static struct janus_json_parameter configure_parameters[] = {
 	/* For VP9 SVC */
 	{"spatial_layer", JSON_INTEGER, JANUS_JSON_PARAM_POSITIVE},
 	{"temporal_layer", JSON_INTEGER, JANUS_JSON_PARAM_POSITIVE},
+	/* This dictates whether simulcast/SVC layers should be
+	 * changed dynamically according to the incoming REMB */
+	{"autochange", JANUS_JSON_BOOL, 0},
 	/* The following is to handle a renegotiation */
 	{"update", JANUS_JSON_BOOL, 0},
 };
@@ -1219,7 +1222,10 @@ static struct janus_json_parameter subscriber_parameters[] = {
 	{"data", JANUS_JSON_BOOL, 0},
 	{"offer_audio", JANUS_JSON_BOOL, 0},
 	{"offer_video", JANUS_JSON_BOOL, 0},
-	{"offer_data", JANUS_JSON_BOOL, 0}
+	{"offer_data", JANUS_JSON_BOOL, 0},
+	/* This dictates whether simulcast/SVC layers should be
+	 * changed dynamically according to the incoming REMB */
+	{"autochange", JANUS_JSON_BOOL, 0}
 };
 
 /* Static configuration instance */
@@ -1345,9 +1351,15 @@ typedef struct janus_videoroom_publisher {
 	guint32 video_pt;		/* Video payload type (depends on room configuration) */
 	guint32 audio_ssrc;		/* Audio SSRC of this publisher */
 	guint32 video_ssrc;		/* Video SSRC of this publisher */
-	uint32_t ssrc[3];		/* Only needed in case VP8 (or H.264) simulcasting is involved */
+	gboolean simulcast;		/* Whether this publisher is simulcasting */
+	gboolean vp9svc;		/* Whether this publisher is VP9 SVC */
+	uint32_t ssrc[3];		/* Only needed in case VP8 simulcasting is involved */
 	int rtpmapid_extmap_id;	/* Only needed in case Firefox's RID-based simulcasting is involved */
 	char *rid[3];			/* Only needed in case Firefox's RID-based simulcasting is involved */
+	uint32_t tlrates[3][3];	/* Apparent bitrate of incoming video streams for each temporal layer (useful for automatic switches) */
+	uint32_t slrates[3];	/* Apparent bitrate of incoming video streams for each spatial layer (useful for automatic switches) */
+	uint32_t tmprates[3][3];/* Same as above, but temporary value we use for calculations */
+	gint64 rate_latest;		/* Time we latest updated the rates */
 	guint8 audio_level_extmap_id;		/* Audio level extmap ID */
 	guint8 video_orient_extmap_id;		/* Video orientation extmap ID */
 	guint8 playout_delay_extmap_id;		/* Playout delay extmap ID */
@@ -1403,6 +1415,7 @@ typedef struct janus_videoroom_subscriber {
 	int templayer;			/* Which VP8 (unavailable for H.264) simulcast temporal layer we should forward, in case the publisher is simulcasting */
 	int templayer_target;	/* As above, but to handle transitions (e.g., wait for keyframe) */
 	gint64 last_relayed;	/* When we relayed the last packet (used to detect when substreams become unavailable) */
+	gboolean autochange;	/* Whether simulcast/SVC layer changes should happen automatically, depending on REMB */
 	janus_vp8_simulcast_context simulcast_context;
 	gboolean audio, video, data;		/* Whether audio, video and/or data must be sent to this subscriber */
 	/* As above, but can't change dynamically (says whether something was negotiated at all in SDP) */
@@ -2251,8 +2264,8 @@ json_t *janus_videoroom_query_session(janus_plugin_session *handle) {
 				json_object_set_new(media, "data", participant->data ? json_true() : json_false());
 				json_object_set_new(info, "media", media);
 				json_object_set_new(info, "bitrate", json_integer(participant->bitrate));
-				if(participant->ssrc[0] != 0)
-					json_object_set_new(info, "simulcast", json_true());
+				json_object_set_new(info, "simulcast", participant->simulcast ? json_true() : json_false());
+				json_object_set_new(info, "vp9-svc", participant->vp9svc ? json_true() : json_false());
 				if(participant->arc || participant->vrc || participant->drc) {
 					json_t *recording = json_object();
 					if(participant->arc && participant->arc->filename)
@@ -2267,6 +2280,28 @@ json_t *janus_videoroom_query_session(janus_plugin_session *handle) {
 					json_object_set_new(info, "audio-level-dBov", json_integer(participant->audio_dBov_level));
 					json_object_set_new(info, "talking", participant->talking ? json_true() : json_false());
 				}
+				json_t *rates = json_object();
+				if(!participant->simulcast && !participant->vp9svc) {
+					/* Easy enough: single video stream, no layers */
+					json_object_set_new(rates, "video-0", json_integer(participant->slrates[0]));
+				} else {
+					char name[10];
+					memset(name, 0, sizeof(name));
+					int i=0, j=0;
+					for(i=0; i<3; i++) {
+						if(participant->vp9svc && i > 1)
+							break;
+						g_snprintf(name, sizeof(name), "video-%d", i);
+						json_object_set_new(rates, name, json_integer(participant->slrates[i]));
+						json_t *tl = json_array();
+						for(j=0; j<3; j++) {
+							json_array_append_new(tl, json_integer(participant->tlrates[i][j]));
+						}
+						g_snprintf(name, sizeof(name), "tlayers-%d", i);
+						json_object_set_new(rates, name, tl);
+					}
+				}
+				json_object_set_new(info, "rates", rates);
 				janus_refcount_decrease(&participant->ref);
 			}
 		} else if(session->participant_type == janus_videoroom_p_type_subscriber) {
@@ -2289,20 +2324,23 @@ json_t *janus_videoroom_query_session(janus_plugin_session *handle) {
 				json_object_set_new(media, "video-offered", participant->video_offered ? json_true() : json_false());
 				json_object_set_new(media, "data", participant->data ? json_true() : json_false());
 				json_object_set_new(media, "data-offered", participant->data_offered ? json_true() : json_false());
-				if(feed && feed->ssrc[0] != 0) {
-					json_object_set_new(info, "simulcast", json_true());
-					json_object_set_new(info, "substream", json_integer(participant->substream));
-					json_object_set_new(info, "substream-target", json_integer(participant->substream_target));
-					json_object_set_new(info, "temporal-layer", json_integer(participant->templayer));
-					json_object_set_new(info, "temporal-layer-target", json_integer(participant->templayer_target));
+				if(feed && feed->simulcast) {
+					json_t *simulcast = json_object();
+					json_object_set_new(simulcast, "substream", json_integer(participant->substream));
+					json_object_set_new(simulcast, "substream-target", json_integer(participant->substream_target));
+					json_object_set_new(simulcast, "temporal-layer", json_integer(participant->templayer));
+					json_object_set_new(simulcast, "temporal-layer-target", json_integer(participant->templayer_target));
+					json_object_set_new(simulcast, "autochange", participant->autochange ? json_true() : json_false());
+					json_object_set_new(info, "simulcast", simulcast);
 				}
 				json_object_set_new(info, "media", media);
-				if(participant->room && participant->room->do_svc) {
+				if(feed && feed->vp9svc) {
 					json_t *svc = json_object();
 					json_object_set_new(svc, "spatial-layer", json_integer(participant->spatial_layer));
 					json_object_set_new(svc, "target-spatial-layer", json_integer(participant->target_spatial_layer));
 					json_object_set_new(svc, "temporal-layer", json_integer(participant->temporal_layer));
 					json_object_set_new(svc, "target-temporal-layer", json_integer(participant->target_temporal_layer));
+					json_object_set_new(svc, "autochange", participant->autochange ? json_true() : json_false());
 					json_object_set_new(info, "svc", svc);
 				}
 			}
@@ -3750,6 +3788,7 @@ void janus_videoroom_incoming_rtp(janus_plugin_session *handle, int video, char 
 		return;
 	}
 	janus_videoroom *videoroom = participant->room;
+	janus_refcount_increase(&videoroom->ref);
 
 	/* In case this is an audio packet and we're doing talk detection, check the audio level extension */
 	if(!video && videoroom->audiolevel_event && participant->audio_active) {
@@ -3800,7 +3839,7 @@ void janus_videoroom_incoming_rtp(janus_plugin_session *handle, int video, char 
 		janus_rtp_header *rtp = (janus_rtp_header *)buf;
 		int sc = -1;
 		/* Check if we're simulcasting, and if so, keep track of the "layer" */
-		if(video && participant->ssrc[0] != 0) {
+		if(video && participant->simulcast) {
 			uint32_t ssrc = ntohl(rtp->ssrc);
 			if(ssrc == participant->ssrc[0])
 				sc = 0;
@@ -3881,16 +3920,23 @@ void janus_videoroom_incoming_rtp(janus_plugin_session *handle, int video, char 
 		packet.length = len;
 		packet.is_video = video;
 		packet.svc = FALSE;
+		packet.spatial_layer = 0;
+		packet.temporal_layer = 0;
 		if(video && videoroom->do_svc) {
 			/* We're doing SVC: let's parse this packet to see which layers are there */
 			int plen = 0;
 			char *payload = janus_rtp_payload(buf, len, &plen);
-			if(payload == NULL)
+			if(payload == NULL) {
+				janus_refcount_decrease(&videoroom->ref);
+				janus_videoroom_publisher_dereference_nodebug(participant);
 				return;
+			}
 			uint8_t pbit = 0, dbit = 0, ubit = 0, bbit = 0, ebit = 0;
 			int found = 0, spatial_layer = 0, temporal_layer = 0;
 			if(janus_vp9_parse_svc(payload, plen, &found, &spatial_layer, &temporal_layer, &pbit, &dbit, &ubit, &bbit, &ebit) == 0) {
 				if(found) {
+					if(!participant->vp9svc)
+						participant->vp9svc = TRUE;
 					packet.svc = TRUE;
 					packet.spatial_layer = spatial_layer;
 					packet.temporal_layer = temporal_layer;
@@ -3900,6 +3946,21 @@ void janus_videoroom_incoming_rtp(janus_plugin_session *handle, int video, char 
 					packet.bbit = bbit;
 					packet.ebit = ebit;
 				}
+			}
+		} else if(video && participant->simulcast) {
+			/* Check if there's any temporal scalability to take into account */
+			int plen = 0;
+			char *payload = janus_rtp_payload(buf, len, &plen);
+			if(payload == NULL) {
+				janus_refcount_decrease(&videoroom->ref);
+				janus_videoroom_publisher_dereference_nodebug(participant);
+				return;
+			}
+			uint16_t picid = 0;
+			uint8_t tlzi = 0, tid = 0, ybit = 0, keyidx = 0;
+			if(janus_vp8_parse_descriptor(payload, plen, &picid, &tlzi, &tid, &ybit, &keyidx) == 0) {
+				packet.spatial_layer = sc;		/* Not really, but close */
+				packet.temporal_layer = tid;	/* Temporal layer */
 			}
 		}
 		packet.ssrc[0] = (sc != -1 ? participant->ssrc[0] : 0);
@@ -3915,12 +3976,52 @@ void janus_videoroom_incoming_rtp(janus_plugin_session *handle, int video, char 
 
 		/* Check if we need to send any REMB, FIR or PLI back to this publisher */
 		if(video && participant->video_active) {
+			/* Also keep track of the bitrates for each video layer */
+			gint64 now = janus_get_monotonic_time();
+			if(participant->rate_latest == 0) {
+				participant->rate_latest = now;
+			} else {
+				if(now-participant->rate_latest >= G_USEC_PER_SEC) {
+					/* Update the latest valid bitrates count, and reset the temporary counters */
+					if(!participant->simulcast && !participant->vp9svc) {
+						/* Easy enough: single video stream, no layers */
+						participant->slrates[0] = participant->tlrates[0][0];
+						participant->tmprates[0][0] = 0;
+					} else {
+						int i=0, j=0;
+						for(i=0; i<3; i++) {
+							participant->slrates[i] = 0;
+							if(participant->room->do_svc && i > 1)
+								break;
+							for(j=0; j<3; j++) {
+								participant->tlrates[i][j] = participant->tmprates[i][j];
+								/* Each temporal layer includes the layer below, so add that */
+								if(j > 0)
+									participant->tlrates[i][j] += participant->tlrates[i][j-1];
+								if(participant->slrates[i] < participant->tlrates[i][j])
+									participant->slrates[i] = participant->tlrates[i][j];
+								participant->tmprates[i][j] = 0;
+								JANUS_LOG(LOG_HUGE, "[%s] Spatial layer #%d, temporal layer #%d: %"SCNu32"\n",
+									participant->display, i, j, participant->tlrates[i][j]);
+							}
+							if(participant->room->do_svc && i > 0)
+								participant->slrates[i] += participant->slrates[i-1];
+							JANUS_LOG(LOG_HUGE, "[%s] Spatial layer #%d: %"SCNu32"\n",
+								participant->display, i, participant->slrates[i]);
+						}
+					}
+					participant->rate_latest = now;
+				}
+			}
+			uint32_t plen = len;
+			participant->tmprates[packet.spatial_layer][packet.temporal_layer] += (plen << 3);
+
 			/* Did we send a REMB already, or is it time to send one? */
 			gboolean send_remb = FALSE;
 			if(participant->remb_latest == 0 && participant->remb_startup > 0) {
 				/* Still in the starting phase, send the ramp-up REMB feedback */
 				send_remb = TRUE;
-			} else if(participant->remb_latest > 0 && janus_get_monotonic_time()-participant->remb_latest >= 5*G_USEC_PER_SEC) {
+			} else if(participant->remb_latest > 0 && now-participant->remb_latest >= 5*G_USEC_PER_SEC) {
 				/* 5 seconds have passed since the last REMB, send a new one */
 				send_remb = TRUE;
 			}
@@ -3937,17 +4038,18 @@ void janus_videoroom_incoming_rtp(janus_plugin_session *handle, int video, char 
 				janus_rtcp_remb((char *)(&rtcpbuf), 24, bitrate);
 				gateway->relay_rtcp(handle, video, rtcpbuf, 24);
 				if(participant->remb_startup == 0)
-					participant->remb_latest = janus_get_monotonic_time();
+					participant->remb_latest = now;
 			}
 			/* Generate FIR/PLI too, if needed */
 			if(video && participant->video_active && (videoroom->fir_freq > 0)) {
-				/* We generate RTCP every tot seconds/frames */
-				gint64 now = janus_get_monotonic_time();
 				/* First check if this is a keyframe, though: if so, we reset the timer */
 				int plen = 0;
 				char *payload = janus_rtp_payload(buf, len, &plen);
-				if(payload == NULL)
+				if(payload == NULL) {
+					janus_refcount_decrease(&videoroom->ref);
+					janus_videoroom_publisher_dereference_nodebug(participant);
 					return;
+				}
 				if(participant->vcodec == JANUS_VIDEOCODEC_VP8) {
 					if(janus_vp8_is_keyframe(payload, plen))
 						participant->fir_latest = now;
@@ -3965,6 +4067,7 @@ void janus_videoroom_incoming_rtp(janus_plugin_session *handle, int video, char 
 			}
 		}
 	}
+	janus_refcount_decrease(&videoroom->ref);
 	janus_videoroom_publisher_dereference_nodebug(participant);
 }
 
@@ -3983,19 +4086,25 @@ void janus_videoroom_incoming_rtcp(janus_plugin_session *handle, int video, char
 		janus_videoroom_subscriber *s = (janus_videoroom_subscriber *)session->participant;
 		if(s == NULL || g_atomic_int_get(&s->destroyed))
 			return;
-		if(!s->video)
-			return;	/* The only feedback we handle is video related anyway... */
+		janus_refcount_increase(&s->ref);
+		if(!s->video) {
+			/* The only feedback we handle is video related anyway... */
+			janus_refcount_decrease(&s->ref);
+			return;
+		}
 		if(janus_rtcp_has_fir(buf, len)) {
 			/* We got a FIR, forward it to the publisher */
 			if(s->feed) {
 				janus_videoroom_publisher *p = s->feed;
 				if(p && p->session) {
+					janus_refcount_increase(&p->ref);
 					char rtcpbuf[20];
 					janus_rtcp_fir((char *)&rtcpbuf, 20, &p->fir_seq);
 					JANUS_LOG(LOG_VERB, "Got a FIR from a subscriber, forwarding it to %"SCNu64" (%s)\n", p->user_id, p->display ? p->display : "??");
 					gateway->relay_rtcp(p->session->handle, 1, rtcpbuf, 20);
 					/* Update the time of when we last sent a keyframe request */
 					p->fir_latest = janus_get_monotonic_time();
+					janus_refcount_decrease(&p->ref);
 				}
 			}
 		}
@@ -4004,19 +4113,93 @@ void janus_videoroom_incoming_rtcp(janus_plugin_session *handle, int video, char
 			if(s->feed) {
 				janus_videoroom_publisher *p = s->feed;
 				if(p && p->session) {
+					janus_refcount_increase(&p->ref);
 					char rtcpbuf[12];
 					janus_rtcp_pli((char *)&rtcpbuf, 12);
 					JANUS_LOG(LOG_VERB, "Got a PLI from a subscriber, forwarding it to %"SCNu64" (%s)\n", p->user_id, p->display ? p->display : "??");
 					gateway->relay_rtcp(p->session->handle, 1, rtcpbuf, 12);
 					/* Update the time of when we last sent a keyframe request */
 					p->fir_latest = janus_get_monotonic_time();
+					janus_refcount_decrease(&p->ref);
 				}
 			}
 		}
 		uint32_t bitrate = janus_rtcp_get_remb(buf, len);
 		if(bitrate > 0) {
 			/* FIXME We got a REMB from this subscriber, should we do something about it? */
+			janus_videoroom_publisher *p = s->feed;
+			if(p && s->autochange && (p->simulcast || p->vp9svc)) {
+				/* Either simulcast or SVC may be involved: check the available layers
+				 * and the related bitrates, and find the best match to this REMB value */
+				janus_refcount_increase(&p->ref);
+				JANUS_LOG(LOG_HUGE, "[%p] Subscriber's bitrate: %"SCNu32"\n", s, bitrate);
+				if(p) {
+					/* Check substreams and/or spatial and temporal layers */
+					int sl = 2, tl = 2, done = 0;
+					for(sl=2; sl >=0; sl--) {
+						if(p->vp9svc)	/* VP9-SVC only has two spatial layers */
+							continue;
+						if(!p->slrates[sl]) {
+							JANUS_LOG(LOG_HUGE, "[%p]  -- Skipping %s #%d (not available)\n",
+								s, (p->simulcast ? "substream" : "spatial layer"), sl);
+							continue;
+						}
+						if(p->slrates[sl] <= bitrate) {
+							JANUS_LOG(LOG_HUGE, "[%p]  -- %s #%d: %"SCNu32" < %"SCNu32"\n",
+								s, (p->simulcast ? "substream" : "spatial layer"), sl, p->slrates[sl], bitrate);
+							break;
+						} else {
+							JANUS_LOG(LOG_HUGE, "[%p]  -- %s #%d: %"SCNu32" > %"SCNu32"\n",
+								s, (p->simulcast ? "substream" : "spatial layer"), sl, p->slrates[sl], bitrate);
+						}
+						for(tl=2; tl >=0; tl--) {
+							if(sl > 0 && tl == 0) {
+								/* We don't drop framerate too much for high quality streams, but
+								 * only for substream #0 when we really have to (very low REMB) */
+								break;
+							}
+							if(!p->tlrates[sl]) {
+								JANUS_LOG(LOG_HUGE, "[%p]  -- -- Skipping %s #%d, temporal layer %d (not available)\n",
+									s, (p->simulcast ? "substream" : "spatial layer"), sl, tl);
+								continue;
+							}
+							if(p->tlrates[sl][tl] <= bitrate) {
+								JANUS_LOG(LOG_HUGE, "[%p]  -- -- %s #%d, temporal layer %d: %"SCNu32" < %"SCNu32"\n",
+									s, (p->simulcast ? "substream" : "spatial layer"), sl, tl, p->tlrates[sl][tl], bitrate);
+								done = 1;
+								break;
+							} else {
+								JANUS_LOG(LOG_HUGE, "[%p]  -- -- %s #%d, temporal layer %d: %"SCNu32" > %"SCNu32"\n",
+									s, (p->simulcast ? "substream" : "spatial layer"), sl, tl, p->tlrates[sl][tl], bitrate);
+							}
+						}
+						if(done)
+							break;
+					}
+					if(sl < 0)
+						sl = 0;
+					if(tl < 0)
+						tl = 0;
+					if(p->simulcast) {
+						if(sl != s->substream_target || tl != s->templayer_target) {
+							JANUS_LOG(LOG_WARN, "[%p] Autochanging to substream #%d (was #%d), temporal layer %d (was #%d): %"SCNu32" < %"SCNu32"\n",
+								s, sl, s->substream_target, tl, s->templayer_target, p->tlrates[sl][tl], bitrate);
+							s->substream_target = sl;
+							s->templayer_target = tl;
+						}
+					} else if(p->vp9svc) {
+						if(sl != s->target_spatial_layer || tl != s->target_temporal_layer) {
+							JANUS_LOG(LOG_WARN, "[%p] Autochanging to spatial layer #%d (was #%d), temporal layer %d (was #%d): %"SCNu32" < %"SCNu32"\n",
+								s, sl, s->substream_target, tl, s->templayer_target, p->tlrates[sl][tl], bitrate);
+							s->target_spatial_layer = sl;
+							s->target_temporal_layer = tl;
+						}
+					}
+				}
+				janus_refcount_decrease(&p->ref);
+			}
 		}
+		janus_refcount_decrease(&s->ref);
 	}
 }
 
@@ -4620,6 +4803,8 @@ static void *janus_videoroom_handler(void *data) {
 				json_t *offer_audio = json_object_get(root, "offer_audio");
 				json_t *offer_video = json_object_get(root, "offer_video");
 				json_t *offer_data = json_object_get(root, "offer_data");
+				json_t *ac = json_object_get(root, "autochange");
+				gboolean autochange  = ac ? json_is_true(ac) : FALSE;
 				janus_videoroom_publisher *owner = NULL;
 				janus_videoroom_publisher *publisher = g_hash_table_lookup(videoroom->participants, &feed_id);
 				if(publisher == NULL || g_atomic_int_get(&publisher->destroyed) || publisher->sdp == NULL) {
@@ -4652,6 +4837,7 @@ static void *janus_videoroom_handler(void *data) {
 					subscriber->feed = publisher;
 					subscriber->pvt_id = pvt_id;
 					subscriber->close_pc = close_pc;
+					subscriber->autochange = autochange;
 					/* Initialize the subscriber context */
 					janus_rtp_switching_context_reset(&subscriber->context);
 					subscriber->audio_offered = offer_audio ? json_is_true(offer_audio) : TRUE;	/* True by default */
@@ -5079,6 +5265,7 @@ static void *janus_videoroom_handler(void *data) {
 				json_t *spatial = json_object_get(root, "spatial_layer");
 				json_t *temporal = json_object_get(root, "temporal_layer");
 				json_t *sc_substream = json_object_get(root, "substream");
+				json_t *autochange = json_object_get(root, "autochange");
 				if(json_integer_value(sc_substream) > 2) {
 					JANUS_LOG(LOG_ERR, "Invalid element (substream should be 0, 1 or 2)\n");
 					error_code = JANUS_VIDEOROOM_ERROR_INVALID_ELEMENT;
@@ -5092,6 +5279,9 @@ static void *janus_videoroom_handler(void *data) {
 					g_snprintf(error_cause, 512, "Invalid value (temporal should be 0, 1 or 2)");
 					goto error;
 				}
+				/* Check if there are changes on the automatic layer changes policy */
+				if(autochange)
+					subscriber->autochange = json_is_true(autochange);
 				/* Update the audio/video/data flags, if set */
 				janus_videoroom_publisher *publisher = subscriber->feed;
 				if(publisher) {
@@ -5120,7 +5310,9 @@ static void *janus_videoroom_handler(void *data) {
 					if(data && publisher->data && subscriber->data_offered)
 						subscriber->data = json_is_true(data);
 					/* Check if a simulcasting-related request is involved */
-					if(sc_substream && publisher->ssrc[0] != 0) {
+					if(sc_substream && publisher->simulcast) {
+						/* Substream specified, disable automatic changes */
+						subscriber->autochange = FALSE;
 						subscriber->substream_target = json_integer_value(sc_substream);
 						JANUS_LOG(LOG_VERB, "Setting video SSRC to let through (simulcast): %"SCNu32" (index %d, was %d)\n",
 							publisher->ssrc[subscriber->substream], subscriber->substream_target, subscriber->substream);
@@ -5137,8 +5329,9 @@ static void *janus_videoroom_handler(void *data) {
 							janus_videoroom_reqfir(publisher, "Simulcasting substream change");
 						}
 					}
-					if(subscriber->feed && subscriber->feed->vcodec == JANUS_VIDEOCODEC_VP8 &&
-							sc_temporal && publisher->ssrc[0] != 0) {
+					if(sc_temporal && publisher->simulcast) {
+						/* Temporal layer specified, disable automatic changes */
+						subscriber->autochange = FALSE;
 						subscriber->templayer_target = json_integer_value(sc_temporal);
 						JANUS_LOG(LOG_VERB, "Setting video temporal layer to let through (simulcast): %d (was %d)\n",
 							subscriber->templayer_target, subscriber->templayer);
@@ -5159,6 +5352,8 @@ static void *janus_videoroom_handler(void *data) {
 				if(subscriber->room->do_svc) {
 					/* Also check if the viewer is trying to configure a layer change */
 					if(spatial) {
+						/* Spatial layer specified, disable automatic changes */
+						subscriber->autochange = FALSE;
 						int spatial_layer = json_integer_value(spatial);
 						if(spatial_layer > 1) {
 							JANUS_LOG(LOG_WARN, "Spatial layer higher than 1, will probably be ignored\n");
@@ -5178,6 +5373,8 @@ static void *janus_videoroom_handler(void *data) {
 						subscriber->target_spatial_layer = spatial_layer;
 					}
 					if(temporal) {
+						/* Temporal layer specified, disable automatic changes */
+						subscriber->autochange = FALSE;
 						int temporal_layer = json_integer_value(temporal);
 						if(temporal_layer > 2) {
 							JANUS_LOG(LOG_WARN, "Temporal layer higher than 2, will probably be ignored\n");
@@ -5314,6 +5511,7 @@ static void *janus_videoroom_handler(void *data) {
 				json_t *audio = json_object_get(root, "audio");
 				json_t *video = json_object_get(root, "video");
 				json_t *data = json_object_get(root, "data");
+				json_t *autochange = json_object_get(root, "autochange");
 				if(!subscriber->room) {
 					JANUS_LOG(LOG_ERR, "Room Destroyed \n");
 					error_code = JANUS_VIDEOROOM_ERROR_NO_SUCH_ROOM;
@@ -5382,6 +5580,9 @@ static void *janus_videoroom_handler(void *data) {
 				publisher->subscribers = g_slist_append(publisher->subscribers, subscriber);
 				janus_mutex_unlock(&publisher->subscribers_mutex);
 				subscriber->feed = publisher;
+				/* Check if there are changes on the automatic layer changes policy */
+				if(autochange)
+					subscriber->autochange = json_is_true(autochange);
 				/* Send a FIR to the new publisher */
 				janus_videoroom_reqfir(publisher, "Switching existing subscriber to new publisher");
 				/* Done */
@@ -5757,11 +5958,15 @@ static void *janus_videoroom_handler(void *data) {
 					if(msg_simulcast && (participant->vcodec == JANUS_VIDEOCODEC_VP8 ||
 							participant->vcodec == JANUS_VIDEOCODEC_H264)) {
 						JANUS_LOG(LOG_VERB, "Publisher is going to do simulcasting\n");
+						participant->simulcast = TRUE;
+						participant->vp9svc = FALSE;
 						participant->ssrc[0] = json_integer_value(json_object_get(msg_simulcast, "ssrc-0"));
 						participant->ssrc[1] = json_integer_value(json_object_get(msg_simulcast, "ssrc-1"));
 						participant->ssrc[2] = json_integer_value(json_object_get(msg_simulcast, "ssrc-2"));
 					} else {
 						/* No simulcasting involved */
+						participant->simulcast = FALSE;
+						participant->vp9svc = FALSE;
 						participant->ssrc[0] = 0;
 						participant->ssrc[1] = 0;
 						participant->ssrc[2] = 0;
@@ -5989,7 +6194,7 @@ static void janus_videoroom_relay_rtp_packet(gpointer data, gpointer user_data) 
 				/* There has been a change: let's wait for a keyframe on the target */
 				int step = (subscriber->substream < 1 && subscriber->substream_target == 2);
 				if(ssrc == packet->ssrc[subscriber->substream_target] || (step && ssrc == packet->ssrc[step])) {
-					//~ if(janus_vp8_is_keyframe(payload, plen)) {
+					if(janus_vp8_is_keyframe(payload, plen)) {
 						uint32_t ssrc_old = 0;
 						if(subscriber->substream != -1)
 							ssrc_old = packet->ssrc[subscriber->substream];
@@ -6003,9 +6208,9 @@ static void janus_videoroom_relay_rtp_packet(gpointer data, gpointer user_data) 
 						json_object_set_new(event, "substream", json_integer(subscriber->substream));
 						gateway->push_event(subscriber->session->handle, &janus_videoroom_plugin, NULL, event, NULL);
 						json_decref(event);
-					//~ } else {
-						//~ JANUS_LOG(LOG_WARN, "Not a keyframe on SSRC %"SCNu32" yet, waiting before switching\n", ssrc);
-					//~ }
+					} else {
+						JANUS_LOG(LOG_HUGE, "Not a keyframe on SSRC %"SCNu32" yet, waiting before switching\n", ssrc);
+					}
 				}
 			}
 			/* If we haven't received our desired substream yet, let's drop temporarily */
@@ -6050,34 +6255,25 @@ static void janus_videoroom_relay_rtp_packet(gpointer data, gpointer user_data) 
 				return;
 			}
 			subscriber->last_relayed = janus_get_monotonic_time();
-			if(subscriber->feed && subscriber->feed->vcodec == JANUS_VIDEOCODEC_VP8) {
-				/* Check if there's any temporal scalability to take into account */
-				uint16_t picid = 0;
-				uint8_t tlzi = 0;
-				uint8_t tid = 0;
-				uint8_t ybit = 0;
-				uint8_t keyidx = 0;
-				if(janus_vp8_parse_descriptor(payload, plen, &picid, &tlzi, &tid, &ybit, &keyidx) == 0) {
-					//~ JANUS_LOG(LOG_WARN, "%"SCNu16", %u, %u, %u, %u\n", picid, tlzi, tid, ybit, keyidx);
-					if(subscriber->templayer != subscriber->templayer_target) {
-						/* FIXME We should be smarter in deciding when to switch */
-						subscriber->templayer = subscriber->templayer_target;
-						/* Notify the user */
-						json_t *event = json_object();
-						json_object_set_new(event, "videoroom", json_string("event"));
-						json_object_set_new(event, "room", json_integer(subscriber->room_id));
-						json_object_set_new(event, "temporal", json_integer(subscriber->templayer));
-						gateway->push_event(subscriber->session->handle, &janus_videoroom_plugin, NULL, event, NULL);
-						json_decref(event);
-					}
-					if(tid > subscriber->templayer) {
-						JANUS_LOG(LOG_HUGE, "Dropping packet (it's temporal layer %d, but we're capping at %d)\n",
-							tid, subscriber->templayer);
-						/* We increase the base sequence number, or there will be gaps when delivering later */
-						subscriber->context.v_base_seq++;
-						return;
-					}
-				}
+
+			/* Check if there's any temporal scalability to take into account */
+			if(subscriber->templayer != subscriber->templayer_target) { 
+				/* FIXME We should be smarter in deciding when to switch */ 
+				subscriber->templayer = subscriber->templayer_target; 
+				/* Notify the user */ 
+				json_t *event = json_object(); 
+				json_object_set_new(event, "videoroom", json_string("event")); 
+				json_object_set_new(event, "room", json_integer(subscriber->room_id)); 
+				json_object_set_new(event, "temporal", json_integer(subscriber->templayer)); 
+				gateway->push_event(subscriber->session->handle, &janus_videoroom_plugin, NULL, event, NULL); 
+				json_decref(event); 
+			}
+			if(packet->temporal_layer > subscriber->templayer) {
+				JANUS_LOG(LOG_HUGE, "Dropping packet (it's temporal layer %d, but we're capping at %d)\n",
+					packet->temporal_layer, subscriber->templayer);
+				/* We increase the base sequence number, or there will be gaps when delivering later */
+				subscriber->context.v_base_seq++;
+				return;
 			}
 			/* If we got here, update the RTP header and send the packet */
 			janus_rtp_header_update(packet->data, &subscriber->context, TRUE, 4500);
