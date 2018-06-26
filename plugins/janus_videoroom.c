@@ -54,7 +54,7 @@ description = This is my awesome room
 is_private = yes|no (private rooms don't appear when you do a 'list' request)
 secret = <optional password needed for manipulating (e.g. destroying) the room>
 pin = <optional password needed for joining the room>
-require_pvtid = yes|no (whether subscriptions are required to provide a valid
+require_pvtid = yes|no (whether subscriptions are required to provide
              a valid private_id to associate with a publisher, default=no)
 publishers = <max number of concurrent senders> (e.g., 6 for a video
              conference or 1 for a webinar, default=3)
@@ -1344,6 +1344,7 @@ typedef struct janus_videoroom_publisher {
 	guint32 pvt_id;		/* This is sent to the publisher for mapping purposes, but shouldn't be shared with others */
 	gchar *display;		/* Display name (just for fun) */
 	gchar *sdp;			/* The SDP this publisher negotiated, if any */
+
 	gboolean audio, video, data;		/* Whether audio, video and/or data is going to be sent by this publisher */
 	janus_audiocodec acodec;	/* Audio codec this publisher is using */
 	janus_videocodec vcodec;	/* Video codec this publisher is using */
@@ -1351,6 +1352,7 @@ typedef struct janus_videoroom_publisher {
 	guint32 video_pt;		/* Video payload type (depends on room configuration) */
 	guint32 audio_ssrc;		/* Audio SSRC of this publisher */
 	guint32 video_ssrc;		/* Video SSRC of this publisher */
+	
 	gboolean simulcast;		/* Whether this publisher is simulcasting */
 	gboolean vp9svc;		/* Whether this publisher is VP9 SVC */
 	uint32_t ssrc[3];		/* Only needed in case VP8 simulcasting is involved */
@@ -1359,37 +1361,45 @@ typedef struct janus_videoroom_publisher {
 	uint32_t tlrates[3][3];	/* Apparent bitrate of incoming video streams for each temporal layer (useful for automatic switches) */
 	uint32_t slrates[3];	/* Apparent bitrate of incoming video streams for each spatial layer (useful for automatic switches) */
 	uint32_t tmprates[3][3];/* Same as above, but temporary value we use for calculations */
+
 	gint64 rate_latest;		/* Time we latest updated the rates */
 	guint8 audio_level_extmap_id;		/* Audio level extmap ID */
 	guint8 video_orient_extmap_id;		/* Video orientation extmap ID */
 	guint8 playout_delay_extmap_id;		/* Playout delay extmap ID */
 	guint8 transport_wide_cc_extmap_id; /* Transport wide cc extmap ID */
+	
 	gboolean audio_active;
 	gboolean video_active;
+	gboolean data_active;
+
 	int audio_dBov_level;		/* Value in dBov of the audio level (last value from extension) */
 	int audio_active_packets;	/* Participant's number of audio packets to accumulate */
 	int audio_dBov_sum;			/* Participant's accumulated dBov value for audio level*/
 	gboolean talking;			/* Whether this participant is currently talking (uses audio levels extension) */
-	gboolean data_active;
+	
 	gboolean firefox;	/* We send Firefox users a different kind of FIR */
 	uint32_t bitrate;
 	gint64 remb_startup;/* Incremental changes on REMB to reach the target at startup */
 	gint64 remb_latest;	/* Time of latest sent REMB (to avoid flooding) */
 	gint64 fir_latest;	/* Time of latest sent FIR (to avoid flooding) */
 	gint fir_seq;		/* FIR sequence number */
+
 	gboolean recording_active;	/* Whether this publisher has to be recorded or not */
 	gchar *recording_base;	/* Base name for the recording (e.g., /path/to/filename, will generate /path/to/filename-audio.mjr and/or /path/to/filename-video.mjr */
 	janus_recorder *arc;	/* The Janus recorder instance for this publisher's audio, if enabled */
 	janus_recorder *vrc;	/* The Janus recorder instance for this user's video, if enabled */
 	janus_recorder *drc;	/* The Janus recorder instance for this publisher's data, if enabled */
 	janus_mutex rec_mutex;	/* Mutex to protect the recorders from race conditions */
+
 	GSList *subscribers;	/* Subscriptions to this publisher (who's watching this publisher)  */
 	GSList *subscriptions;	/* Subscriptions this publisher has created (who this publisher is watching) */
 	janus_mutex subscribers_mutex;
+
 	GHashTable *rtp_forwarders;
 	GHashTable *srtp_contexts;
 	janus_mutex rtp_forwarders_mutex;
 	int udp_sock; /* The udp socket on which to forward rtp packets */
+
 	gboolean kicked;	/* Whether this participant has been kicked */
 	volatile gint destroyed;
 	janus_refcount ref;
@@ -1410,6 +1420,7 @@ typedef struct janus_videoroom_subscriber {
 	guint32 pvt_id;			/* Private ID of the participant that is subscribing (if available/provided) */
 	janus_sdp *sdp;			/* Offer we sent this listener (may be updated within renegotiations) */
 	janus_rtp_switching_context context;	/* Needed in case there are publisher switches on this subscriber */
+
 	int substream;			/* Which VP8 (or H.264) simulcast substream we should forward, in case the publisher is simulcasting */
 	int substream_target;	/* As above, but to handle transitions (e.g., wait for keyframe) */
 	int templayer;			/* Which VP8 (unavailable for H.264) simulcast temporal layer we should forward, in case the publisher is simulcasting */
@@ -1417,15 +1428,18 @@ typedef struct janus_videoroom_subscriber {
 	gint64 last_relayed;	/* When we relayed the last packet (used to detect when substreams become unavailable) */
 	gboolean autochange;	/* Whether simulcast/SVC layer changes should happen automatically, depending on REMB */
 	janus_vp8_simulcast_context simulcast_context;
+
 	gboolean audio, video, data;		/* Whether audio, video and/or data must be sent to this subscriber */
 	/* As above, but can't change dynamically (says whether something was negotiated at all in SDP) */
 	gboolean audio_offered, video_offered, data_offered;
 	gboolean paused;
 	gboolean kicked;	/* Whether this subscription belongs to a participant that has been kicked */
+
 	/* The following are only relevant if we're doing VP9 SVC, and are not to be confused with plain
 	 * simulcast, which has similar info (substream/templayer) but in a completely different context */
 	int spatial_layer, target_spatial_layer;
 	int temporal_layer, target_temporal_layer;
+
 	volatile gint destroyed;
 	janus_refcount ref;
 } janus_videoroom_subscriber;
@@ -2088,6 +2102,19 @@ void janus_videoroom_create_session(janus_plugin_session *handle, int *error) {
 	return;
 }
 
+static janus_videoroom* janus_videoroom_lookup_room_withref(guint64 room_id){
+	janus_mutex_lock(&rooms_mutex);
+	janus_videoroom* videoroom = g_hash_table_lookup(rooms, &room_id);
+	if (videoroom) {
+		janus_refcount_increase(&videoroom->ref);
+	}
+	else {
+		JANUS_LOG(LOG_ERR, "No such room (%"SCNu64")\n", room_id);
+	}
+	janus_mutex_unlock(&rooms_mutex);
+	return videoroom;
+}
+
 static janus_videoroom_publisher *janus_videoroom_session_get_publisher(janus_videoroom_session *session) {
 	janus_mutex_lock(&session->mutex);
 	janus_videoroom_publisher *publisher = (janus_videoroom_publisher *)session->participant;
@@ -2145,30 +2172,33 @@ static void janus_videoroom_participant_joining(janus_videoroom_publisher *p) {
 
 static void janus_videoroom_leave_or_unpublish(janus_videoroom_publisher *participant, gboolean is_leaving, gboolean kicked) {
 	/* we need to check if the room still exists, may have been destroyed already */
-	if(participant->room == NULL)
+	if(!participant || !participant->room_id)
 		return;
-	janus_mutex_lock(&rooms_mutex);
-	if (!g_hash_table_lookup(rooms, &participant->room_id)) {
+	janus_videoroom* room = janus_videoroom_lookup_room_withref(participant->room_id);
+	if (!room) {
 		JANUS_LOG(LOG_ERR, "No such room (%"SCNu64")\n", participant->room_id);
-		janus_mutex_unlock(&rooms_mutex);
 		return;
 	}
-	janus_mutex_unlock(&rooms_mutex);
-	if(!participant->room || g_atomic_int_get(&participant->room->destroyed))
+	if(g_atomic_int_get(&room->destroyed)){
+		JANUS_LOG(LOG_ERR, "wrong room state (%"SCNu64") skip janus_videoroom_leave_or_unpublish (%"SCNu64")\n", 
+			participant->room_id, participant->user_id);
+		janus_refcount_decrease(&room->ref);
 		return;
+	}
 	json_t *event = json_object();
 	json_object_set_new(event, "videoroom", json_string("event"));
 	json_object_set_new(event, "room", json_integer(participant->room_id));
 	json_object_set_new(event, is_leaving ? (kicked ? "kicked" : "leaving") : "unpublished",
 		json_integer(participant->user_id));
-	janus_mutex_lock(&participant->room->mutex);
+	janus_mutex_lock(&room->mutex);
 	janus_videoroom_notify_participants(participant, event);
 	if(is_leaving) {
-		g_hash_table_remove(participant->room->participants, &participant->user_id);
-		g_hash_table_remove(participant->room->private_ids, GUINT_TO_POINTER(participant->pvt_id));
+		g_hash_table_remove(room->participants, &participant->user_id);
+		g_hash_table_remove(room->private_ids, GUINT_TO_POINTER(participant->pvt_id));
 	}
-	janus_mutex_unlock(&participant->room->mutex);
+	janus_mutex_unlock(&room->mutex);
 	json_decref(event);
+	janus_refcount_decrease(&room->ref);
 }
 
 void janus_videoroom_destroy_session(janus_plugin_session *handle, int *error) {
@@ -2401,6 +2431,56 @@ static int janus_videoroom_access_room(json_t *root, gboolean check_modify, gboo
 	return 0;
 }
 
+static gboolean janus_videoroom_save(janus_videoroom* videoroom){
+	gboolean save = TRUE;
+	/* This room is permanent: save to the configuration file too
+		* FIXME: We should check if anything fails... */
+	JANUS_LOG(LOG_VERB, "Modifying room %"SCNu64" permanently in config file\n", videoroom->room_id);
+	janus_mutex_lock(&config_mutex);
+	char cat[BUFSIZ], value[BUFSIZ];
+	/* The room ID is the category */
+	g_snprintf(cat, BUFSIZ, "%"SCNu64, videoroom->room_id);
+	/* Remove the old category first */
+	janus_config_remove_category(config, cat);
+	/* Now write the room details again */
+	janus_config_add_category(config, cat);
+	janus_config_add_item(config, cat, "description", videoroom->room_name);
+	if(videoroom->is_private)
+		janus_config_add_item(config, cat, "is_private", "yes");
+	if(videoroom->require_pvtid)
+		janus_config_add_item(config, cat, "require_pvtid", "yes");
+	g_snprintf(value, BUFSIZ, "%"SCNu32, videoroom->bitrate);
+	janus_config_add_item(config, cat, "bitrate", value);
+	if(videoroom->bitrate_cap)
+		janus_config_add_item(config, cat, "bitrate_cap", "yes");
+	g_snprintf(value, BUFSIZ, "%d", videoroom->max_publishers);
+	janus_config_add_item(config, cat, "publishers", value);
+	if(videoroom->fir_freq) {
+		g_snprintf(value, BUFSIZ, "%"SCNu16, videoroom->fir_freq);
+		janus_config_add_item(config, cat, "fir_freq", value);
+	}
+	char audio_codecs[100];
+	char video_codecs[100];
+	janus_videoroom_codecstr(videoroom, audio_codecs, video_codecs, sizeof(audio_codecs), ",");
+	janus_config_add_item(config, cat, "audiocodec", audio_codecs);
+	janus_config_add_item(config, cat, "videocodec", video_codecs);
+	if(videoroom->do_svc)
+		janus_config_add_item(config, cat, "video_svc", "yes");
+	if(videoroom->room_secret)
+		janus_config_add_item(config, cat, "secret", videoroom->room_secret);
+	if(videoroom->room_pin)
+		janus_config_add_item(config, cat, "pin", videoroom->room_pin);
+	if(videoroom->record)
+		janus_config_add_item(config, cat, "record", "yes");
+	if(videoroom->rec_dir)
+		janus_config_add_item(config, cat, "rec_dir", videoroom->rec_dir);
+	/* Save modified configuration */
+	if(janus_config_save(config, config_folder, JANUS_VIDEOROOM_PACKAGE) < 0)
+		save = FALSE;	/* This will notify the user the room changes are not permanent */
+	janus_mutex_unlock(&config_mutex);
+	return save;
+}
+
 struct janus_plugin_result *janus_videoroom_handle_message(janus_plugin_session *handle, char *transaction, json_t *message, json_t *jsep) {
 	if(g_atomic_int_get(&stopping) || !g_atomic_int_get(&initialized))
 		return janus_plugin_result_new(JANUS_PLUGIN_ERROR, g_atomic_int_get(&stopping) ? "Shutting down" : "Plugin not initialized", NULL);
@@ -2481,6 +2561,7 @@ struct janus_plugin_result *janus_videoroom_handle_message(janus_plugin_session 
 		json_t *publishers = json_object_get(root, "publishers");
 		json_t *allowed = json_object_get(root, "allowed");
 		json_t *audiocodec = json_object_get(root, "audiocodec");
+		janus_audiocodec acodec[3] = {JANUS_AUDIOCODEC_OPUS,JANUS_AUDIOCODEC_NONE,JANUS_AUDIOCODEC_NONE};
 		if(audiocodec) {
 			const char *audiocodec_value = json_string_value(audiocodec);
 			gchar **list = g_strsplit(audiocodec_value, ",", 4);
@@ -2491,7 +2572,8 @@ struct janus_plugin_result *janus_videoroom_handle_message(janus_plugin_session 
 					if(i == 3) {
 						break;
 					}
-					if(strlen(codec) == 0 || JANUS_AUDIOCODEC_NONE == janus_audiocodec_from_name(codec)) {
+					acodec[i] = janus_audiocodec_from_name(codec);
+					if(JANUS_AUDIOCODEC_NONE == acodec[i]) {
 						JANUS_LOG(LOG_ERR, "Invalid element (audiocodec can only be or contain opus, isac32, isac16, pcmu, pcma or g722)\n");
 						error_code = JANUS_VIDEOROOM_ERROR_INVALID_ELEMENT;
 						g_snprintf(error_cause, 512, "Invalid element (audiocodec can only be or contain opus, isac32, isac16, pcmu, pcma or g722)");
@@ -2504,6 +2586,7 @@ struct janus_plugin_result *janus_videoroom_handle_message(janus_plugin_session 
 			g_clear_pointer(&list, g_strfreev);
 		}
 		json_t *videocodec = json_object_get(root, "videocodec");
+		janus_videocodec vcodec[3] = {JANUS_VIDEOCODEC_VP8,JANUS_VIDEOCODEC_NONE,JANUS_VIDEOCODEC_NONE};
 		if(videocodec) {
 			const char *videocodec_value = json_string_value(videocodec);
 			gchar **list = g_strsplit(videocodec_value, ",", 4);
@@ -2514,7 +2597,8 @@ struct janus_plugin_result *janus_videoroom_handle_message(janus_plugin_session 
 					if(i == 3) {
 						break;
 					}
-					if(strlen(codec) == 0 || JANUS_VIDEOCODEC_NONE == janus_videocodec_from_name(codec)) {
+					vcodec[i] = janus_videocodec_from_name(codec);
+					if(JANUS_VIDEOCODEC_NONE == vcodec[i]) {
 						JANUS_LOG(LOG_ERR, "Invalid element (videocodec can only be or contain vp8, vp9 or h264)\n");
 						error_code = JANUS_VIDEOROOM_ERROR_INVALID_ELEMENT;
 						g_snprintf(error_cause, 512, "Invalid element (videocodec can only be or contain vp8, vp9 or h264)");
@@ -2628,53 +2712,8 @@ struct janus_plugin_result *janus_videoroom_handle_message(janus_plugin_session 
 		if(fir_freq)
 			videoroom->fir_freq = json_integer_value(fir_freq);
 		/* By default, we force Opus as the only audio codec */
-		videoroom->acodec[0] = JANUS_AUDIOCODEC_OPUS;
-		videoroom->acodec[1] = JANUS_AUDIOCODEC_NONE;
-		videoroom->acodec[2] = JANUS_AUDIOCODEC_NONE;
-		/* Check if we're forcing a different single codec, or allowing more than one */
-		if(audiocodec) {
-			const char *audiocodec_value = json_string_value(audiocodec);
-			gchar **list = g_strsplit(audiocodec_value, ",", 4);
-			gchar *codec = list[0];
-			if(codec != NULL) {
-				int i=0;
-				while(codec != NULL) {
-					if(i == 3) {
-						JANUS_LOG(LOG_WARN, "Ignoring extra audio codecs: %s\n", codec);
-						break;
-					}
-					if(strlen(codec) > 0)
-						videoroom->acodec[i] = janus_audiocodec_from_name(codec);
-					i++;
-					codec = list[i];
-				}
-			}
-			g_clear_pointer(&list, g_strfreev);
-		}
-		/* By default, we force VP8 as the only video codec */
-		videoroom->vcodec[0] = JANUS_VIDEOCODEC_VP8;
-		videoroom->vcodec[1] = JANUS_VIDEOCODEC_NONE;
-		videoroom->vcodec[2] = JANUS_VIDEOCODEC_NONE;
-		/* Check if we're forcing a different single codec, or allowing more than one */
-		if(videocodec) {
-			const char *videocodec_value = json_string_value(videocodec);
-			gchar **list = g_strsplit(videocodec_value, ",", 4);
-			gchar *codec = list[0];
-			if(codec != NULL) {
-				int i=0;
-				while(codec != NULL) {
-					if(i == 3) {
-						JANUS_LOG(LOG_WARN, "Ignoring extra video codecs: %s\n", codec);
-						break;
-					}
-					if(strlen(codec) > 0)
-						videoroom->vcodec[i] = janus_videocodec_from_name(codec);
-					i++;
-					codec = list[i];
-				}
-			}
-			g_clear_pointer(&list, g_strfreev);
-		}
+		memcpy(videoroom->acodec, acodec, sizeof(acodec));
+		memcpy(videoroom->vcodec, vcodec, sizeof(vcodec));
 		if(svc && json_is_true(svc)) {
 			if(videoroom->vcodec[0] == JANUS_VIDEOCODEC_VP9 &&
 					videoroom->vcodec[1] == JANUS_VIDEOCODEC_NONE &&
@@ -2744,70 +2783,7 @@ struct janus_plugin_result *janus_videoroom_handle_message(janus_plugin_session 
 			JANUS_LOG(LOG_VERB, "  -- Room is going to be recorded in %s\n", videoroom->rec_dir ? videoroom->rec_dir : "the current folder");
 		}
 		if(save) {
-			/* This room is permanent: save to the configuration file too
-			 * FIXME: We should check if anything fails... */
-			JANUS_LOG(LOG_VERB, "Saving room %"SCNu64" permanently in config file\n", videoroom->room_id);
-			janus_mutex_lock(&config_mutex);
-			char cat[BUFSIZ], value[BUFSIZ];
-			/* The room ID is the category */
-			g_snprintf(cat, BUFSIZ, "%"SCNu64, videoroom->room_id);
-			janus_config_add_category(config, cat);
-			/* Now for the values */
-			janus_config_add_item(config, cat, "description", videoroom->room_name);
-			if(videoroom->is_private)
-				janus_config_add_item(config, cat, "is_private", "yes");
-			if(videoroom->require_pvtid)
-				janus_config_add_item(config, cat, "require_pvtid", "yes");
-			g_snprintf(value, BUFSIZ, "%"SCNu32, videoroom->bitrate);
-			janus_config_add_item(config, cat, "bitrate", value);
-			if(videoroom->bitrate_cap)
-				janus_config_add_item(config, cat, "bitrate_cap", "yes");
-			g_snprintf(value, BUFSIZ, "%d", videoroom->max_publishers);
-			janus_config_add_item(config, cat, "publishers", value);
-			if(videoroom->fir_freq) {
-				g_snprintf(value, BUFSIZ, "%"SCNu16, videoroom->fir_freq);
-				janus_config_add_item(config, cat, "fir_freq", value);
-			}
-			char video_codecs[100];
-			char audio_codecs[100];
-			janus_videoroom_codecstr(videoroom, audio_codecs, video_codecs, sizeof(audio_codecs), ",");
-			janus_config_add_item(config, cat, "audiocodec", audio_codecs);
-			janus_config_add_item(config, cat, "videocodec", video_codecs);
-			if(videoroom->do_svc)
-				janus_config_add_item(config, cat, "video_svc", "yes");
-			if(videoroom->room_secret)
-				janus_config_add_item(config, cat, "secret", videoroom->room_secret);
-			if(videoroom->room_pin)
-				janus_config_add_item(config, cat, "pin", videoroom->room_pin);
-			if(videoroom->audiolevel_ext) {
-				janus_config_add_item(config, cat, "audiolevel_ext", "yes");
-				if(videoroom->audiolevel_event)
-					janus_config_add_item(config, cat, "audiolevel_event", "yes");
-				if(videoroom->audio_active_packets > 0) {
-					g_snprintf(value, BUFSIZ, "%d", videoroom->audio_active_packets);
-					janus_config_add_item(config, cat, "audio_active_packets", value);
-				}
-				if(videoroom->audio_level_average > 0) {
-					g_snprintf(value, BUFSIZ, "%d", videoroom->audio_level_average);
-					janus_config_add_item(config, cat, "audio_level_average", value);
-				}
-			}
-			if(videoroom->videoorient_ext)
-				janus_config_add_item(config, cat, "videoorient_ext", "yes");
-			if(videoroom->playoutdelay_ext)
-				janus_config_add_item(config, cat, "playoutdelay_ext", "yes");
-			if(videoroom->transport_wide_cc_ext)
-				janus_config_add_item(config, cat, "transport_wide_cc_ext", "yes");
-			if(videoroom->notify_joining)
-				janus_config_add_item(config, cat, "notify_joining", "yes");
-			if(videoroom->record)
-				janus_config_add_item(config, cat, "record", "yes");
-			if(videoroom->rec_dir)
-				janus_config_add_item(config, cat, "rec_dir", videoroom->rec_dir);
-			/* Save modified configuration */
-			if(janus_config_save(config, config_folder, JANUS_VIDEOROOM_PACKAGE) < 0)
-				save = FALSE;	/* This will notify the user the room is not permanent */
-			janus_mutex_unlock(&config_mutex);
+			save = janus_videoroom_save(videoroom);
 		}
 
 		g_hash_table_insert(rooms, janus_uint64_dup(videoroom->room_id), videoroom);
@@ -2898,51 +2874,7 @@ struct janus_plugin_result *janus_videoroom_handle_message(janus_plugin_session 
 			g_free(old_pin);
 		}
 		if(save) {
-			/* This room is permanent: save to the configuration file too
-			 * FIXME: We should check if anything fails... */
-			JANUS_LOG(LOG_VERB, "Modifying room %"SCNu64" permanently in config file\n", videoroom->room_id);
-			janus_mutex_lock(&config_mutex);
-			char cat[BUFSIZ], value[BUFSIZ];
-			/* The room ID is the category */
-			g_snprintf(cat, BUFSIZ, "%"SCNu64, videoroom->room_id);
-			/* Remove the old category first */
-			janus_config_remove_category(config, cat);
-			/* Now write the room details again */
-			janus_config_add_category(config, cat);
-			janus_config_add_item(config, cat, "description", videoroom->room_name);
-			if(videoroom->is_private)
-				janus_config_add_item(config, cat, "is_private", "yes");
-			if(videoroom->require_pvtid)
-				janus_config_add_item(config, cat, "require_pvtid", "yes");
-			g_snprintf(value, BUFSIZ, "%"SCNu32, videoroom->bitrate);
-			janus_config_add_item(config, cat, "bitrate", value);
-			if(videoroom->bitrate_cap)
-				janus_config_add_item(config, cat, "bitrate_cap", "yes");
-			g_snprintf(value, BUFSIZ, "%d", videoroom->max_publishers);
-			janus_config_add_item(config, cat, "publishers", value);
-			if(videoroom->fir_freq) {
-				g_snprintf(value, BUFSIZ, "%"SCNu16, videoroom->fir_freq);
-				janus_config_add_item(config, cat, "fir_freq", value);
-			}
-			char audio_codecs[100];
-			char video_codecs[100];
-			janus_videoroom_codecstr(videoroom, audio_codecs, video_codecs, sizeof(audio_codecs), ",");
-			janus_config_add_item(config, cat, "audiocodec", audio_codecs);
-			janus_config_add_item(config, cat, "videocodec", video_codecs);
-			if(videoroom->do_svc)
-				janus_config_add_item(config, cat, "video_svc", "yes");
-			if(videoroom->room_secret)
-				janus_config_add_item(config, cat, "secret", videoroom->room_secret);
-			if(videoroom->room_pin)
-				janus_config_add_item(config, cat, "pin", videoroom->room_pin);
-			if(videoroom->record)
-				janus_config_add_item(config, cat, "record", "yes");
-			if(videoroom->rec_dir)
-				janus_config_add_item(config, cat, "rec_dir", videoroom->rec_dir);
-			/* Save modified configuration */
-			if(janus_config_save(config, config_folder, JANUS_VIDEOROOM_PACKAGE) < 0)
-				save = FALSE;	/* This will notify the user the room changes are not permanent */
-			janus_mutex_unlock(&config_mutex);
+			save = janus_videoroom_save_room(videoroom);
 		}
 		janus_mutex_unlock(&rooms_mutex);
 		/* Send info back */
